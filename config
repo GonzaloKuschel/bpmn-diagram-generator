@@ -1,0 +1,1310 @@
+"""
+BPMN Process Generator - Core Module
+Generates BPMN 2.0 compliant process diagrams from documentation, transcriptions, or structured data.
+
+Author: BPMN Generator Team
+Version: 1.0
+License: MIT
+"""
+
+import json
+import re
+import uuid
+from dataclasses import dataclass, field, asdict
+from typing import List, Dict, Optional, Tuple, Set
+from enum import Enum
+from datetime import datetime
+import xml.etree.ElementTree as ET
+from xml.dom import minidom
+
+
+# ============================================================================
+# DATA MODELS
+# ============================================================================
+
+class ElementType(Enum):
+    """Tipos de elementos BPMN"""
+    START_EVENT = "startEvent"
+    END_EVENT = "endEvent"
+    INTERMEDIATE_EVENT = "intermediateCatchEvent"
+    TASK = "task"
+    SEND_TASK = "sendTask"
+    RECEIVE_TASK = "receiveTask"
+    SERVICE_TASK = "serviceTask"
+    EXCLUSIVE_GATEWAY = "exclusiveGateway"
+    PARALLEL_GATEWAY = "parallelGateway"
+    INCLUSIVE_GATEWAY = "inclusiveGateway"
+    SUBPROCESS = "subprocess"
+    LANE = "lane"
+
+
+@dataclass
+class Position:
+    """Posición X,Y de un elemento"""
+    x: float
+    y: float
+    
+    def __add__(self, other):
+        return Position(self.x + other.x, self.y + other.y)
+
+
+@dataclass
+class Bounds:
+    """Dimensiones de un elemento (ancho, alto)"""
+    width: float = 100
+    height: float = 80
+    
+    # Dimensiones estándar BPMN
+    EVENT_WIDTH: float = 36
+    EVENT_HEIGHT: float = 36
+    TASK_WIDTH: float = 100
+    TASK_HEIGHT: float = 80
+    GATEWAY_WIDTH: float = 50
+    GATEWAY_HEIGHT: float = 50
+
+
+@dataclass
+class BPMNElement:
+    """Elemento base BPMN"""
+    id: str
+    name: str
+    type: ElementType
+    position: Position = field(default_factory=lambda: Position(0, 0))
+    bounds: Bounds = field(default_factory=Bounds)
+    lane_id: Optional[str] = None
+    incoming: List[str] = field(default_factory=list)
+    outgoing: List[str] = field(default_factory=list)
+    documentation: Optional[str] = None
+    
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "type": self.type.value,
+            "position": {"x": self.position.x, "y": self.position.y},
+            "lane": self.lane_id,
+            "incoming": self.incoming,
+            "outgoing": self.outgoing
+        }
+
+
+@dataclass
+class SequenceFlow:
+    """Flujo de secuencia entre elementos"""
+    id: str
+    source_ref: str
+    target_ref: str
+    name: Optional[str] = None
+    condition_expression: Optional[str] = None
+    
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "source": self.source_ref,
+            "target": self.target_ref,
+            "label": self.name,
+            "condition": self.condition_expression
+        }
+
+
+@dataclass
+class Lane:
+    """Carril/swimlane BPMN con información de rol y responsabilidades"""
+    id: str
+    name: str
+    process_ref: str = "Process_1"
+    elements: List[str] = field(default_factory=list)
+    position: Position = field(default_factory=lambda: Position(0, 0))
+    role: Optional[str] = None  # Rol/título del responsable
+    responsibilities: Optional[str] = None  # Descripción de responsabilidades
+    department: Optional[str] = None  # Departamento
+    
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "role": self.role,
+            "responsibilities": self.responsibilities,
+            "department": self.department,
+            "elements": self.elements
+        }
+
+
+@dataclass
+class BPMNProcess:
+    """Proceso BPMN completo"""
+    id: str
+    name: str
+    elements: Dict[str, BPMNElement] = field(default_factory=dict)
+    flows: Dict[str, SequenceFlow] = field(default_factory=dict)
+    lanes: Dict[str, Lane] = field(default_factory=dict)
+    subprocess_map: Dict[str, 'BPMNProcess'] = field(default_factory=dict)
+    
+    def add_element(self, element: BPMNElement):
+        """Agrega elemento al proceso"""
+        self.elements[element.id] = element
+    
+    def add_flow(self, flow: SequenceFlow):
+        """Agrega flujo al proceso"""
+        self.flows[flow.id] = flow
+        
+        # Actualizar incoming/outgoing
+        if flow.target_ref in self.elements:
+            self.elements[flow.target_ref].incoming.append(flow.id)
+        if flow.source_ref in self.elements:
+            self.elements[flow.source_ref].outgoing.append(flow.id)
+    
+    def add_lane(self, lane: Lane):
+        """Agrega carril al proceso"""
+        self.lanes[lane.id] = lane
+    
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "elements": {k: v.to_dict() for k, v in self.elements.items()},
+            "flows": {k: v.to_dict() for k, v in self.flows.items()},
+            "lanes": {k: v.to_dict() for k, v in self.lanes.items()}
+        }
+
+
+# ============================================================================
+# EXTRACTOR - Extrae elementos BPMN del texto
+# ============================================================================
+
+class BPMNExtractor:
+    """Extrae elementos BPMN de documentación de texto"""
+    
+    # Patrones de identificación
+    ACTOR_PATTERNS = [
+        r'(?:el|la|los|las|un|una)\s+([\w\s]+?)(?:\s+(?:revisa|prepara|valida|aprueba|rechaza|envia|recibe|verifica|solicita))',
+        r'(?:quien|que|quien es)\s+([\w\s]+?)(?:\s+(?:revisa|prepara))',
+    ]
+    
+    DECISION_PATTERNS = [
+        r'¿?(si|si (?:el|la|los|las))\s+([^?]+)\?',
+        r'(?:según|depende de|en caso de)\s+([^.!?]+)',
+        r'(?:condición|condicional)\s+([^.!?]+)',
+    ]
+    
+    TASK_VERBS = [
+        'solicitar', 'recibir', 'revisar', 'validar', 'verificar', 'analizar',
+        'aprobar', 'rechazar', 'preparar', 'enviar', 'consultar', 'evaluar',
+        'procesar', 'completar', 'llenar', 'firmar', 'archivar', 'notificar',
+        'asignar', 'coordinar', 'generar', 'emitir', 'cargar', 'descargar'
+    ]
+    
+    def __init__(self, language: str = "es"):
+        self.language = language
+        self.extracted_data = {
+            "actors": [],
+            "tasks": [],
+            "decisions": [],
+            "events": [],
+            "flows": []
+        }
+    
+    def extract(self, text: str) -> dict:
+        """Extrae todos los elementos del texto"""
+        # Limpiar y normalizar
+        text = self._normalize_text(text)
+        
+        # Extraer elementos
+        self.extracted_data["actors"] = self._extract_actors(text)
+        self.extracted_data["tasks"] = self._extract_tasks(text)
+        self.extracted_data["decisions"] = self._extract_decisions(text)
+        self.extracted_data["events"] = self._extract_events(text)
+        self.extracted_data["flows"] = self._extract_flows(text)
+        
+        return self.extracted_data
+    
+    def _normalize_text(self, text: str) -> str:
+        """Normaliza el texto"""
+        # Remover espacios extras
+        text = re.sub(r'\s+', ' ', text)
+        # Convertir a minúsculas para análisis
+        text = text.lower()
+        return text
+    
+    def _extract_actors(self, text: str) -> List[Dict]:
+        """Extrae actores/roles del texto con información de responsabilidades"""
+        actors = {}
+        
+        # Patrones para actores y sus responsabilidades
+        patterns = [
+            r'(?:el|la|los|las|un|una)\s+(cliente|vendedor|gerente|contador|administrador|usuario|empleado|departamento|equipo|sistem[a|as])',
+            r'([\w\s]+)\s+(?:solicita|recibe|revisa|aprueba|rechaza|envia)',
+            r'(?:responsable|encargado|responsables|equipo de)\s+([\w\s]+)',
+        ]
+        
+        for pattern in patterns:
+            matches = re.finditer(pattern, text)
+            for match in matches:
+                actor_name = match.group(1).strip().title()
+                if actor_name and len(actor_name.split()) <= 3:  # Evitar cadenas muy largas
+                    if actor_name not in actors:
+                        actors[actor_name] = {
+                            "id": re.sub(r'\s+', '_', actor_name.lower()),
+                            "name": actor_name,
+                            "role": actor_name,
+                            "responsibilities": []
+                        }
+        
+        # Actores comunes con roles predefinidos
+        common_actors_roles = {
+            'Cliente': {'role': 'Client', 'department': 'External', 'responsibilities': 'Initiates requests and provides information'},
+            'Vendedor': {'role': 'Sales Representative', 'department': 'Sales', 'responsibilities': 'Processes orders and manages customer interactions'},
+            'Gerente': {'role': 'Manager', 'department': 'Management', 'responsibilities': 'Reviews and approves decisions'},
+            'Contador': {'role': 'Accountant', 'department': 'Finance', 'responsibilities': 'Manages financial transactions'},
+            'Administrador': {'role': 'Administrator', 'department': 'IT', 'responsibilities': 'Maintains systems and access'},
+            'Usuario': {'role': 'User', 'department': 'General', 'responsibilities': 'Uses the system'},
+            'Empleado': {'role': 'Employee', 'department': 'Operations', 'responsibilities': 'Performs operational tasks'},
+            'Departamento': {'role': 'Department', 'department': 'Organization', 'responsibilities': 'Executes department tasks'},
+            'Equipo': {'role': 'Team', 'department': 'Organization', 'responsibilities': 'Collaborates on tasks'},
+            'Sistema': {'role': 'System', 'department': 'IT', 'responsibilities': 'Processes automated tasks'}
+        }
+        
+        # Agregar actores comunes y asignar roles
+        for actor_name, role_info in common_actors_roles.items():
+            if actor_name not in actors:
+                # Verificar si hay mención en el texto
+                if actor_name.lower() in text:
+                    actors[actor_name] = {
+                        "id": re.sub(r'\s+', '_', actor_name.lower()),
+                        "name": actor_name,
+                        "role": role_info.get('role', actor_name),
+                        "department": role_info.get('department', ''),
+                        "responsibilities": role_info.get('responsibilities', '')
+                    }
+            else:
+                # Actualizar con información de rol si no tiene
+                if 'role' not in actors[actor_name] or actors[actor_name]['role'] == actor_name:
+                    actors[actor_name].update({
+                        'role': role_info.get('role', actor_name),
+                        'department': role_info.get('department', ''),
+                        'responsibilities': role_info.get('responsibilities', '')
+                    })
+        
+        # Detectar responsabilidades específicas del texto
+        for actor_name in actors:
+            # Buscar verbos asociados a cada actor
+            pattern = rf'{actor_name.lower()}\s+(?:.*?)\s+((?:{"|".join(self.TASK_VERBS)}))'
+            matches = re.finditer(pattern, text)
+            responsibilities = []
+            for match in matches:
+                verb = match.group(1)
+                responsibilities.append(verb.capitalize())
+            
+            if responsibilities and 'responsibilities' not in actors[actor_name]:
+                actors[actor_name]['responsibilities'] = ', '.join(responsibilities)
+        
+        return list(actors.values())
+        
+        result = []
+        for actor in actors:
+            result.append({
+                "id": f"actor_{len(result)}",
+                "name": actor
+            })
+        
+        # Si no se encontraron actores, usar comunes
+        if not result:
+            for i, actor in enumerate(common_actors[:2]):
+                result.append({"id": f"actor_{i}", "name": actor})
+        
+        return result
+    
+    def _extract_tasks(self, text: str) -> List[Dict]:
+        """Extrae tareas del texto"""
+        tasks = []
+        task_counter = 0
+        
+        # Buscar frases con verbos de acción
+        sentences = re.split(r'[.!?]+', text)
+        
+        for sentence in sentences:
+            for verb in self.TASK_VERBS:
+                if verb in sentence:
+                    # Extraer la tarea
+                    match = re.search(rf'(?:el|la|los|las)?\s*\w*\s*({verb}[^.!?]*)', sentence)
+                    if match:
+                        task_text = match.group(1).strip()
+                        # Limpiar y titleCase
+                        task_name = ' '.join(word.capitalize() for word in task_text.split())[:50]
+                        
+                        tasks.append({
+                            "id": f"task_{task_counter}",
+                            "name": task_name,
+                            "verb": verb
+                        })
+                        task_counter += 1
+                        break
+        
+        # Eliminar duplicados
+        seen = set()
+        unique_tasks = []
+        for task in tasks:
+            if task["name"] not in seen:
+                seen.add(task["name"])
+                unique_tasks.append(task)
+        
+        return unique_tasks
+    
+    def _extract_decisions(self, text: str) -> List[Dict]:
+        """Extrae puntos de decisión del texto"""
+        decisions = []
+        decision_counter = 0
+        
+        # Patrones de decisión
+        patterns = [
+            (r'¿?si\s+([^,]+?)(?:,|entonces|\s+se)\s+([^.!?]+?)(?:\s+si no|\s+sino|\s+en caso contrario)\s+([^.!?]+)', 
+             lambda m: (m.group(1).strip(), m.group(2).strip(), m.group(3).strip())),
+            (r'según\s+([^,]+?)(?:,|:)\s+([^.!?]+?)(?:\s+o\s+|\s+u\s+)([^.!?]+)',
+             lambda m: (m.group(1).strip(), m.group(2).strip(), m.group(3).strip())),
+        ]
+        
+        for pattern, extractor in patterns:
+            matches = re.finditer(pattern, text)
+            for match in matches:
+                condition, yes_path, no_path = extractor(match)
+                decisions.append({
+                    "id": f"decision_{decision_counter}",
+                    "name": f"¿{condition.capitalize()}?",
+                    "condition": condition,
+                    "yes_outcome": yes_path.capitalize(),
+                    "no_outcome": no_path.capitalize()
+                })
+                decision_counter += 1
+        
+        return decisions
+    
+    def _extract_events(self, text: str) -> List[Dict]:
+        """Extrae eventos del texto"""
+        events = {
+            "start": None,
+            "end": None,
+            "intermediate": []
+        }
+        
+        # Evento de inicio (primeras palabras)
+        start_match = re.search(r'^(?:.*?)(\w+(?:\s+\w+)?)', text)
+        if start_match:
+            events["start"] = {
+                "id": "event_start",
+                "name": start_match.group(1).capitalize(),
+                "type": "startEvent"
+            }
+        
+        # Evento final (últimas palabras)
+        end_match = re.search(r'(?:.*?)(\w+(?:\s+\w+)?)(?:\s*$|[.!?]$)', text)
+        if end_match:
+            events["end"] = {
+                "id": "event_end",
+                "name": f"{end_match.group(1).capitalize()} completado",
+                "type": "endEvent"
+            }
+        
+        return events
+    
+    def _extract_flows(self, text: str) -> List[Dict]:
+        """Extrae flujos entre elementos"""
+        flows = []
+        
+        # Palabras conectoras de flujo
+        connectors = ['luego', 'después', 'entonces', 'cuando', 'una vez', 'finalmente', 'seguidamente']
+        
+        # Buscar conectores para determinar secuencia
+        for connector in connectors:
+            matches = re.finditer(f'({connector}[^.!?]+)', text)
+            for match in matches:
+                flows.append({
+                    "type": "sequence",
+                    "description": match.group(1)
+                })
+        
+        return flows
+
+
+# ============================================================================
+# GRAPH BUILDER - Construye el grafo BPMN
+# ============================================================================
+
+class BPMNGraphBuilder:
+    """Construye el grafo BPMN a partir de elementos extraídos"""
+    
+    # Configuración de posicionamiento
+    ELEMENT_SPACING_X = 200
+    ELEMENT_SPACING_Y = 150
+    LANE_HEIGHT = 250
+    LANE_SPACING = 50
+    POOL_PADDING = 30
+    
+    def __init__(self, process_name: str = "Proceso_1"):
+        self.process_name = process_name
+        self.process = BPMNProcess(
+            id="Process_1",
+            name=process_name
+        )
+        self.element_positions = {}
+        self.current_x = 100
+        self.current_y = 100
+    
+    def build(self, extracted_data: dict, swimlane_by: str = "role") -> BPMNProcess:
+        """Construye el proceso BPMN completo"""
+        
+        # 1. Crear lanes/swimlanes
+        self._create_lanes(extracted_data["actors"], swimlane_by)
+        
+        # 2. Crear elementos (eventos, tareas, decisiones)
+        self._create_events(extracted_data["events"])
+        self._create_tasks(extracted_data["tasks"], extracted_data["actors"])
+        self._create_decisions(extracted_data["decisions"])
+        
+        # 3. Conectar con flujos
+        self._create_flows(extracted_data["tasks"], extracted_data["decisions"])
+        
+        # 4. Calcular posiciones
+        self._calculate_positions()
+        
+        return self.process
+    
+    def _create_lanes(self, actors: List[Dict], swimlane_by: str):
+        """Crea lanes/swimlanes para cada actor con información de roles"""
+        lane_position = Position(0, 0)
+        
+        if swimlane_by == "none":
+            # Un solo lane general
+            lane = Lane(
+                id="lane_general",
+                name="General",
+                position=lane_position,
+                role="General Process",
+                responsibilities="Coordina todas las actividades del proceso"
+            )
+            self.process.add_lane(lane)
+            self.current_lane = "lane_general"
+        else:
+            # Un lane por actor con información detallada
+            for i, actor in enumerate(actors):
+                lane_id = f"lane_{actor['id']}"
+                
+                # Extraer información de rol si existe
+                role = actor.get("role", actor.get("name", ""))
+                department = actor.get("department", None)
+                responsibilities = actor.get("responsibilities", None)
+                
+                lane = Lane(
+                    id=lane_id,
+                    name=actor["name"],
+                    position=Position(0, i * (self.LANE_HEIGHT + self.LANE_SPACING)),
+                    role=role,
+                    department=department,
+                    responsibilities=responsibilities
+                )
+                self.process.add_lane(lane)
+    
+    def _create_events(self, events: dict):
+        """Crea eventos de inicio y fin"""
+        
+        # Start event
+        if events.get("start"):
+            start_event = BPMNElement(
+                id="event_start",
+                name=events["start"]["name"],
+                type=ElementType.START_EVENT,
+                position=Position(self.current_x, self.current_y),
+                bounds=Bounds(36, 36),
+                lane_id="lane_general" if "lane_general" in self.process.lanes else list(self.process.lanes.keys())[0]
+            )
+            self.process.add_element(start_event)
+            self.element_positions["event_start"] = 0
+        
+        # End event
+        if events.get("end"):
+            end_event = BPMNElement(
+                id="event_end",
+                name=events["end"]["name"],
+                type=ElementType.END_EVENT,
+                position=Position(self.current_x + 2000, self.current_y),
+                bounds=Bounds(36, 36),
+                lane_id="lane_general" if "lane_general" in self.process.lanes else list(self.process.lanes.keys())[0]
+            )
+            self.process.add_element(end_event)
+            self.element_positions["event_end"] = 999999
+    
+    def _create_tasks(self, tasks: List[Dict], actors: List[Dict]):
+        """Crea elementos de tarea"""
+        for i, task in enumerate(tasks):
+            task_id = task["id"]
+            
+            # Determinar lane basado en verb o actor
+            lane_id = self._assign_lane(task, actors)
+            
+            task_element = BPMNElement(
+                id=task_id,
+                name=task["name"],
+                type=ElementType.TASK,
+                position=Position(self.current_x + (i + 1) * self.ELEMENT_SPACING_X, self.current_y),
+                bounds=Bounds(100, 80),
+                lane_id=lane_id
+            )
+            
+            self.process.add_element(task_element)
+            self.element_positions[task_id] = i + 1
+            
+            # Agregar al lane
+            if lane_id in self.process.lanes:
+                self.process.lanes[lane_id].elements.append(task_id)
+    
+    def _create_decisions(self, decisions: List[Dict]):
+        """Crea gateways de decisión"""
+        for i, decision in enumerate(decisions):
+            decision_id = decision["id"]
+            
+            decision_element = BPMNElement(
+                id=decision_id,
+                name=decision["name"],
+                type=ElementType.EXCLUSIVE_GATEWAY,
+                position=Position(self.current_x + 1500 + i * self.ELEMENT_SPACING_X, self.current_y),
+                bounds=Bounds(50, 50),
+                lane_id="lane_general" if "lane_general" in self.process.lanes else list(self.process.lanes.keys())[0]
+            )
+            
+            self.process.add_element(decision_element)
+            self.element_positions[decision_id] = 500 + i
+    
+    def _create_flows(self, tasks: List[Dict], decisions: List[Dict]):
+        """Crea flujos de secuencia entre elementos"""
+        flow_counter = 0
+        
+        # Flujo: Start -> Primera tarea
+        if "event_start" in self.process.elements and tasks:
+            flow = SequenceFlow(
+                id=f"flow_{flow_counter}",
+                source_ref="event_start",
+                target_ref=tasks[0]["id"],
+                name=None
+            )
+            self.process.add_flow(flow)
+            flow_counter += 1
+        
+        # Flujos entre tareas (secuencia)
+        for i in range(len(tasks) - 1):
+            flow = SequenceFlow(
+                id=f"flow_{flow_counter}",
+                source_ref=tasks[i]["id"],
+                target_ref=tasks[i + 1]["id"],
+                name=None
+            )
+            self.process.add_flow(flow)
+            flow_counter += 1
+        
+        # Flujos desde tareas a decisiones
+        if tasks and decisions:
+            last_task = tasks[-1]["id"] if tasks else "event_start"
+            for decision in decisions:
+                flow = SequenceFlow(
+                    id=f"flow_{flow_counter}",
+                    source_ref=last_task,
+                    target_ref=decision["id"],
+                    name=None
+                )
+                self.process.add_flow(flow)
+                flow_counter += 1
+        
+        # Flujos desde decisiones (SÍ/NO)
+        for i, decision in enumerate(decisions):
+            # Rama SÍ
+            flow_yes = SequenceFlow(
+                id=f"flow_{flow_counter}",
+                source_ref=decision["id"],
+                target_ref="event_end",
+                name=decision.get("yes_outcome", "Sí"),
+                condition_expression=f"outcome == '{decision.get('yes_outcome', 'Sí')}'"
+            )
+            self.process.add_flow(flow_yes)
+            flow_counter += 1
+            
+            # Rama NO
+            flow_no = SequenceFlow(
+                id=f"flow_{flow_counter}",
+                source_ref=decision["id"],
+                target_ref="event_end",
+                name=decision.get("no_outcome", "No"),
+                condition_expression=f"outcome == '{decision.get('no_outcome', 'No')}'"
+            )
+            self.process.add_flow(flow_no)
+            flow_counter += 1
+    
+    def _assign_lane(self, task: Dict, actors: List[Dict]) -> str:
+        """Asigna un lane a una tarea basado en su verbo"""
+        # Mapeo simple de verbos a actores
+        verb_actor_map = {
+            'solicitar': 0,      # Cliente
+            'revisar': 1,        # Gerente
+            'validar': 1,        # Gerente
+            'aprobar': 1,        # Gerente
+            'rechazar': 1,       # Gerente
+            'preparar': 2,       # Vendedor
+            'enviar': 2,         # Vendedor
+            'recibir': 0,        # Cliente
+        }
+        
+        verb = task.get("verb", "")
+        actor_idx = verb_actor_map.get(verb, 0)
+        
+        if actor_idx < len(actors):
+            return f"lane_{actors[actor_idx]['id']}"
+        
+        # Fallback: primer lane disponible
+        return list(self.process.lanes.keys())[0] if self.process.lanes else "lane_general"
+    
+    def _calculate_positions(self):
+        """Calcula posiciones finales basadas en topología"""
+        # Usar topological sort para ordenar elementos por flujo
+        visited = set()
+        positions = {}
+        x_offset = 100
+        y_offset = 100
+        
+        def visit(element_id, x_pos):
+            if element_id in visited:
+                return x_pos
+            visited.add(element_id)
+            
+            element = self.process.elements.get(element_id)
+            if element:
+                # Asignar posición X basada en orden topológico
+                element.position.x = x_pos
+                
+                # Asignar posición Y basada en lane
+                if element.lane_id in self.process.lanes:
+                    lane = self.process.lanes[element.lane_id]
+                    lane_idx = list(self.process.lanes.keys()).index(element.lane_id)
+                    element.position.y = 50 + lane_idx * self.LANE_HEIGHT
+                
+                # Procesar elementos posteriores
+                next_x = x_pos + self.ELEMENT_SPACING_X
+                for outgoing_flow_id in element.outgoing:
+                    if outgoing_flow_id in self.process.flows:
+                        next_element_id = self.process.flows[outgoing_flow_id].target_ref
+                        next_x = max(next_x, visit(next_element_id, next_x))
+                
+                return next_x
+            
+            return x_pos
+        
+        # Visitar desde start event
+        if "event_start" in self.process.elements:
+            visit("event_start", 100)
+
+
+# ============================================================================
+# XML SERIALIZER - Genera BPMN 2.0 XML válido
+# ============================================================================
+
+class BPMNSerializer:
+    """Serializa proceso BPMN a XML BPMN 2.0 compliant"""
+    
+    # Namespaces BPMN 2.0
+    NS = {
+        'bpmn2': 'http://www.omg.org/spec/BPMN/20100524/MODEL',
+        'bpmndi': 'http://www.omg.org/spec/BPMN/20100524/DI',
+        'dc': 'http://www.omg.org/spec/DD/20100524/DC',
+        'di': 'http://www.omg.org/spec/DD/20100524/DI',
+        'camunda': 'http://camunda.org/schema/1.0/bpmn',
+    }
+    
+    def __init__(self, process: BPMNProcess):
+        self.process = process
+        self.root = None
+    
+    def serialize(self) -> str:
+        """Genera XML BPMN 2.0 válido"""
+        # Registrar namespaces
+        for prefix, uri in self.NS.items():
+            ET.register_namespace(prefix, uri)
+        
+        # Crear raíz
+        self.root = ET.Element(
+            '{http://www.omg.org/spec/BPMN/20100524/MODEL}definitions',
+            {
+                'id': 'Definitions_1',
+                'targetNamespace': 'http://bpmn.io/schema/bpmn',
+                'xmlns:xsi': 'http://www.w3.org/2001/XMLSchema-instance',
+                'xmlns:bpmn2': 'http://www.omg.org/spec/BPMN/20100524/MODEL',
+                'xmlns:bpmndi': 'http://www.omg.org/spec/BPMN/20100524/DI',
+                'xmlns:dc': 'http://www.omg.org/spec/DD/20100524/DC',
+                'xmlns:di': 'http://www.omg.org/spec/DD/20100524/DI',
+                'xmlns:camunda': 'http://camunda.org/schema/1.0/bpmn',
+                'exporter': 'BPMN Process Generator v1.0',
+                'exporterVersion': '1.0'
+            }
+        )
+        
+        # Crear proceso
+        process_elem = ET.SubElement(
+            self.root,
+            '{http://www.omg.org/spec/BPMN/20100524/MODEL}process',
+            {
+                'id': self.process.id,
+                'name': self.process.name,
+                'isExecutable': 'true'
+            }
+        )
+        
+        # Agregar collaboration con participants (swimlanes)
+        if self.process.lanes:
+            collaboration = ET.SubElement(
+                self.root,
+                '{http://www.omg.org/spec/BPMN/20100524/MODEL}collaboration',
+                {'id': 'Collaboration_1'}
+            )
+            
+            for lane_id, lane in self.process.lanes.items():
+                participant = ET.SubElement(
+                    collaboration,
+                    '{http://www.omg.org/spec/BPMN/20100524/MODEL}participant',
+                    {
+                        'id': f'Participant_{lane_id}',
+                        'name': lane.name,
+                        'processRef': self.process.id
+                    }
+                )
+        
+        # Agregar elementos al proceso
+        self._serialize_elements(process_elem)
+        
+        # Agregar flujos
+        self._serialize_flows(process_elem)
+        
+        # Agregar diagram interchange (DI) para visualización
+        self._serialize_diagram_interchange()
+        
+        # Pretty print y retornar
+        return self._prettify_xml()
+    
+    def _serialize_elements(self, process_elem: ET.Element):
+        """Serializa elementos BPMN"""
+        
+        # Crear lane set si hay lanes
+        if self.process.lanes:
+            lane_set = ET.SubElement(
+                process_elem,
+                '{http://www.omg.org/spec/BPMN/20100524/MODEL}laneSet',
+                {'id': 'LaneSet_1'}
+            )
+            
+            for lane_id, lane in self.process.lanes.items():
+                lane_elem = ET.SubElement(
+                    lane_set,
+                    '{http://www.omg.org/spec/BPMN/20100524/MODEL}lane',
+                    {
+                        'id': lane_id,
+                        'name': lane.name
+                    }
+                )
+                
+                # Agregar información de rol como partDefinition
+                if lane.role or lane.responsibilities or lane.department:
+                    # Crear documentación con información de rol
+                    documentation = ET.SubElement(
+                        lane_elem,
+                        '{http://www.omg.org/spec/BPMN/20100524/MODEL}documentation'
+                    )
+                    doc_text = f"Lane: {lane.name}"
+                    if lane.role:
+                        doc_text += f"\nRole: {lane.role}"
+                    if lane.department:
+                        doc_text += f"\nDepartment: {lane.department}"
+                    if lane.responsibilities:
+                        doc_text += f"\nResponsibilities: {lane.responsibilities}"
+                    documentation.text = doc_text
+                
+                # Agregar elementos a la lane
+                for element_id in lane.elements:
+                    if element_id in self.process.elements:
+                        flow_node_ref = ET.SubElement(
+                            lane_elem,
+                            '{http://www.omg.org/spec/BPMN/20100524/MODEL}flowNodeRef'
+                        )
+                        flow_node_ref.text = element_id
+        
+        # Crear elementos
+        for element_id, element in self.process.elements.items():
+            if element.type == ElementType.START_EVENT:
+                elem = ET.SubElement(
+                    process_elem,
+                    '{http://www.omg.org/spec/BPMN/20100524/MODEL}startEvent',
+                    {'id': element_id, 'name': element.name}
+                )
+            
+            elif element.type == ElementType.END_EVENT:
+                elem = ET.SubElement(
+                    process_elem,
+                    '{http://www.omg.org/spec/BPMN/20100524/MODEL}endEvent',
+                    {'id': element_id, 'name': element.name}
+                )
+            
+            elif element.type == ElementType.TASK:
+                elem = ET.SubElement(
+                    process_elem,
+                    '{http://www.omg.org/spec/BPMN/20100524/MODEL}task',
+                    {'id': element_id, 'name': element.name}
+                )
+            
+            elif element.type == ElementType.EXCLUSIVE_GATEWAY:
+                elem = ET.SubElement(
+                    process_elem,
+                    '{http://www.omg.org/spec/BPMN/20100524/MODEL}exclusiveGateway',
+                    {'id': element_id, 'name': element.name}
+                )
+            
+            else:
+                continue
+            
+            # Agregar incoming flows
+            for incoming_flow_id in element.incoming:
+                incoming = ET.SubElement(
+                    elem,
+                    '{http://www.omg.org/spec/BPMN/20100524/MODEL}incoming'
+                )
+                incoming.text = incoming_flow_id
+            
+            # Agregar outgoing flows
+            for outgoing_flow_id in element.outgoing:
+                outgoing = ET.SubElement(
+                    elem,
+                    '{http://www.omg.org/spec/BPMN/20100524/MODEL}outgoing'
+                )
+                outgoing.text = outgoing_flow_id
+            
+            # Agregar documentación si existe
+            if element.documentation:
+                documentation = ET.SubElement(
+                    elem,
+                    '{http://www.omg.org/spec/BPMN/20100524/MODEL}documentation'
+                )
+                documentation.text = element.documentation
+    
+    def _serialize_flows(self, process_elem: ET.Element):
+        """Serializa flujos de secuencia"""
+        for flow_id, flow in self.process.flows.items():
+            flow_elem = ET.SubElement(
+                process_elem,
+                '{http://www.omg.org/spec/BPMN/20100524/MODEL}sequenceFlow',
+                {
+                    'id': flow_id,
+                    'sourceRef': flow.source_ref,
+                    'targetRef': flow.target_ref,
+                    'name': flow.name or ''
+                }
+            )
+            
+            # Agregar condición si existe
+            if flow.condition_expression:
+                condition = ET.SubElement(
+                    flow_elem,
+                    '{http://www.omg.org/spec/BPMN/20100524/MODEL}conditionExpression',
+                    {'xsi:type': 'bpmn2:tFormalExpression'}
+                )
+                condition.text = flow.condition_expression
+    
+    def _serialize_diagram_interchange(self):
+        """Serializa información de diagrama (DI) para visualización"""
+        diagram = ET.SubElement(
+            self.root,
+            '{http://www.omg.org/spec/BPMN/20100524/DI}BPMNDiagram',
+            {'id': 'BPMNDiagram_1', 'name': f'Diagrama de {self.process.name}'}
+        )
+        
+        plane = ET.SubElement(
+            diagram,
+            '{http://www.omg.org/spec/BPMN/20100524/DI}BPMNPlane',
+            {'id': 'BPMNPlane_1', 'bpmnElement': self.process.id}
+        )
+        
+        # Shapes para elementos
+        for element_id, element in self.process.elements.items():
+            shape = ET.SubElement(
+                plane,
+                '{http://www.omg.org/spec/BPMN/20100524/DI}BPMNShape',
+                {'id': f'Shape_{element_id}', 'bpmnElement': element_id}
+            )
+            
+            bounds = ET.SubElement(
+                shape,
+                '{http://www.omg.org/spec/DD/20100524/DC}Bounds',
+                {
+                    'x': str(element.position.x),
+                    'y': str(element.position.y),
+                    'width': str(element.bounds.width),
+                    'height': str(element.bounds.height)
+                }
+            )
+        
+        # Edges para flujos
+        for flow_id, flow in self.process.flows.items():
+            edge = ET.SubElement(
+                plane,
+                '{http://www.omg.org/spec/BPMN/20100524/DI}BPMNEdge',
+                {'id': f'Edge_{flow_id}', 'bpmnElement': flow_id}
+            )
+            
+            # Agregar puntos de ruta (simple línea recta)
+            source = self.process.elements[flow.source_ref]
+            target = self.process.elements[flow.target_ref]
+            
+            waypoint1 = ET.SubElement(
+                edge,
+                '{http://www.omg.org/spec/DD/20100524/DI}waypoint',
+                {'x': str(source.position.x + source.bounds.width / 2),
+                 'y': str(source.position.y + source.bounds.height / 2)}
+            )
+            
+            waypoint2 = ET.SubElement(
+                edge,
+                '{http://www.omg.org/spec/DD/20100524/DI}waypoint',
+                {'x': str(target.position.x + target.bounds.width / 2),
+                 'y': str(target.position.y + target.bounds.height / 2)}
+            )
+    
+    def _prettify_xml(self) -> str:
+        """Formatea XML para legibilidad"""
+        rough_string = ET.tostring(self.root, encoding='unicode')
+        reparsed = minidom.parseString(rough_string)
+        pretty = reparsed.toprettyxml(indent="  ")
+        
+        # Remover líneas en blanco extras
+        return '\n'.join([line for line in pretty.split('\n') if line.strip()])
+
+
+# ============================================================================
+# SVG RENDERER - Genera visualización SVG
+# ============================================================================
+
+class SVGRenderer:
+    """Renderiza diagrama BPMN a SVG"""
+    
+    # Colores BPMN
+    COLORS = {
+        'startEvent': '#90EE90',      # Verde claro
+        'endEvent': '#FFB6C6',        # Rojo claro
+        'task': '#87CEEB',            # Azul cielo
+        'exclusiveGateway': '#FFD700', # Oro
+        'lane': '#F0F0F0',            # Gris claro
+        'flow': '#333333',            # Negro
+        'text': '#000000'
+    }
+    
+    def __init__(self, process: BPMNProcess, width: int = 1400, height: int = 800):
+        self.process = process
+        self.width = width
+        self.height = height
+        self.svg_elements = []
+    
+    def render(self) -> str:
+        """Genera SVG del diagrama"""
+        # Crear SVG raíz
+        svg = f'''<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" 
+     width="{self.width}" height="{self.height}"
+     viewBox="0 0 {self.width} {self.height}"
+     style="background-color: white; border: 1px solid #ccc;">
+  <defs>
+    <style>
+      .bpmn-lane {{ fill: {self.COLORS['lane']}; stroke: #999; stroke-width: 1; }}
+      .bpmn-task {{ fill: {self.COLORS['task']}; stroke: #333; stroke-width: 2; }}
+      .bpmn-event {{ fill: {self.COLORS['startEvent']}; stroke: #333; stroke-width: 2; }}
+      .bpmn-gateway {{ fill: {self.COLORS['exclusiveGateway']}; stroke: #333; stroke-width: 2; }}
+      .bpmn-flow {{ stroke: {self.COLORS['flow']}; stroke-width: 2; fill: none; }}
+      .bpmn-label {{ font-family: Arial, sans-serif; font-size: 12px; text-anchor: middle; }}
+      .lane-label {{ font-family: Arial, sans-serif; font-size: 14px; font-weight: bold; }}
+      .arrow {{ fill: {self.COLORS['flow']}; }}
+    </style>
+    <marker id="arrowhead" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+      <polygon points="0 0, 10 3, 0 6" class="arrow" />
+    </marker>
+  </defs>
+'''
+        
+        # Dibujar lanes
+        svg += self._render_lanes()
+        
+        # Dibujar flujos
+        svg += self._render_flows()
+        
+        # Dibujar elementos
+        svg += self._render_elements()
+        
+        svg += '</svg>'
+        return svg
+    
+    def _render_lanes(self) -> str:
+        """Renderiza lanes/swimlanes con información de roles y responsabilidades"""
+        svg = ''
+        lane_height = 280  # Aumentado para acomodar información adicional
+        lane_y = 50
+        
+        for lane_id, lane in self.process.lanes.items():
+            svg += f'''
+  <!-- Lane: {lane.name} -->
+  <rect class="bpmn-lane" x="50" y="{lane_y}" width="{self.width - 100}" height="{lane_height}" />
+  
+  <!-- Lane Label (vertical) -->
+  <text class="lane-label" x="20" y="{lane_y + lane_height // 2}" 
+        transform="rotate(-90 20 {lane_y + lane_height // 2})" text-anchor="middle">
+    {lane.name}
+  </text>
+  
+  <!-- Lane Information Box -->
+  <rect x="60" y="{lane_y + 5}" width="{self.width - 120}" height="55" 
+        fill="#f0f0f0" stroke="#999" stroke-width="1" rx="3"/>
+'''
+            
+            # Información de rol
+            current_y = lane_y + 20
+            if lane.role:
+                svg += f'''  <text x="70" y="{current_y}" style="font-family: Arial; font-size: 11px; font-weight: bold; fill: #333;">
+    Role: <tspan style="fill: #0066cc;">{lane.role}</tspan>
+  </text>
+'''
+                current_y += 15
+            
+            # Información de departamento
+            if lane.department:
+                svg += f'''  <text x="70" y="{current_y}" style="font-family: Arial; font-size: 11px; fill: #555;">
+    Department: {lane.department}
+  </text>
+'''
+                current_y += 15
+            
+            # Información de responsabilidades (truncada si es muy larga)
+            if lane.responsibilities:
+                responsibilities_text = lane.responsibilities[:40] + "..." if len(lane.responsibilities) > 40 else lane.responsibilities
+                svg += f'''  <text x="70" y="{current_y}" style="font-family: Arial; font-size: 10px; fill: #666;">
+    Responsibilities: <tspan style="font-style: italic;">{responsibilities_text}</tspan>
+  </text>
+'''
+            
+            lane_y += lane_height + 20
+        
+        return svg
+    
+    def _render_flows(self) -> str:
+        """Renderiza flujos de secuencia"""
+        svg = ''
+        
+        for flow_id, flow in self.process.flows.items():
+            source = self.process.elements.get(flow.source_ref)
+            target = self.process.elements.get(flow.target_ref)
+            
+            if not source or not target:
+                continue
+            
+            x1 = source.position.x + source.bounds.width / 2
+            y1 = source.position.y + source.bounds.height / 2
+            x2 = target.position.x + target.bounds.width / 2
+            y2 = target.position.y + target.bounds.height / 2
+            
+            # Línea con flechas
+            svg += f'''
+  <!-- Flow: {flow.name or flow_id} -->
+  <line class="bpmn-flow" x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" marker-end="url(#arrowhead)" />
+'''
+            
+            # Etiqueta del flujo
+            if flow.name:
+                mid_x = (x1 + x2) / 2
+                mid_y = (y1 + y2) / 2
+                svg += f'  <text class="bpmn-label" x="{mid_x}" y="{mid_y - 5}">{flow.name}</text>\n'
+        
+        return svg
+    
+    def _render_elements(self) -> str:
+        """Renderiza elementos BPMN"""
+        svg = ''
+        
+        for element_id, element in self.process.elements.items():
+            x = element.position.x
+            y = element.position.y
+            w = element.bounds.width
+            h = element.bounds.height
+            
+            if element.type == ElementType.START_EVENT or element.type == ElementType.END_EVENT:
+                # Círculo para eventos
+                color = self.COLORS['startEvent'] if element.type == ElementType.START_EVENT else self.COLORS['endEvent']
+                svg += f'''
+  <!-- Event: {element.name} -->
+  <circle class="bpmn-event" cx="{x + w/2}" cy="{y + h/2}" r="{w/2}" style="fill: {color};" />
+  <text class="bpmn-label" x="{x + w/2}" y="{y + h + 20}">{element.name}</text>
+'''
+            
+            elif element.type == ElementType.TASK:
+                # Rectángulo para tareas
+                svg += f'''
+  <!-- Task: {element.name} -->
+  <rect class="bpmn-task" x="{x}" y="{y}" width="{w}" height="{h}" rx="5" />
+  <text class="bpmn-label" x="{x + w/2}" y="{y + h/2 + 5}" style="word-wrap: break-word; width: {w}px;">
+    {element.name[:20]}...
+  </text>
+'''
+            
+            elif element.type == ElementType.EXCLUSIVE_GATEWAY:
+                # Diamante para gateways
+                points = f"{x + w/2},{y} {x + w},{y + h/2} {x + w/2},{y + h} {x},{y + h/2}"
+                svg += f'''
+  <!-- Gateway: {element.name} -->
+  <polygon class="bpmn-gateway" points="{points}" />
+  <text class="bpmn-label" x="{x + w/2}" y="{y + h + 20}">{element.name}</text>
+'''
+        
+        return svg
+
+
+# ============================================================================
+# MAIN PROCESSOR
+# ============================================================================
+
+class BPMNProcessor:
+    """Orquesta el procesamiento completo: extracción -> construcción -> serialización"""
+    
+    def __init__(self, language: str = "es"):
+        self.language = language
+        self.extractor = BPMNExtractor(language)
+    
+    def process(self, 
+                input_text: str,
+                process_name: str = "Nuevo Proceso",
+                swimlane_by: str = "role",
+                output_formats: List[str] = None) -> dict:
+        """
+        Procesa texto y genera BPMN
+        
+        Args:
+            input_text: Documentación, transcripción o JSON
+            process_name: Nombre del proceso
+            swimlane_by: "role" | "department" | "none"
+            output_formats: ["bpmn_xml", "json", "svg", "mermaid"]
+        
+        Returns:
+            Diccionario con resultados en múltiples formatos
+        """
+        
+        if output_formats is None:
+            output_formats = ["bpmn_xml", "json", "svg"]
+        
+        try:
+            # 1. Extraer elementos
+            print(f"[1/4] Extrayendo elementos BPMN...")
+            extracted = self.extractor.extract(input_text)
+            
+            # 2. Construir grafo
+            print(f"[2/4] Construyendo grafo BPMN...")
+            builder = BPMNGraphBuilder(process_name)
+            process = builder.build(extracted, swimlane_by)
+            
+            # 3. Serializar
+            results = {}
+            
+            if "bpmn_xml" in output_formats:
+                print(f"[3/4] Generando BPMN 2.0 XML...")
+                serializer = BPMNSerializer(process)
+                results["bpmn_xml"] = serializer.serialize()
+            
+            if "json" in output_formats:
+                print(f"[3/4] Generando JSON...")
+                results["json"] = process.to_dict()
+            
+            if "svg" in output_formats:
+                print(f"[3/4] Renderizando SVG...")
+                renderer = SVGRenderer(process)
+                results["svg"] = renderer.render()
+            
+            if "mermaid" in output_formats:
+                print(f"[3/4] Generando Mermaid...")
+                results["mermaid"] = self._generate_mermaid(process)
+            
+            # 4. Metadatos
+            results["metadata"] = {
+                "process_name": process_name,
+                "timestamp": datetime.now().isoformat(),
+                "elements_count": len(process.elements),
+                "flows_count": len(process.flows),
+                "lanes_count": len(process.lanes),
+                "actors": [actor["name"] for actor in extracted.get("actors", [])],
+                "tasks_count": len(extracted.get("tasks", [])),
+                "decisions_count": len(extracted.get("decisions", []))
+            }
+            
+            print(f"[4/4] ¡Proceso completado exitosamente!")
+            return {
+                "success": True,
+                "data": results,
+                "errors": []
+            }
+        
+        except Exception as e:
+            return {
+                "success": False,
+                "data": {},
+                "errors": [str(e)]
+            }
+    
+    def _generate_mermaid(self, process: BPMNProcess) -> str:
+        """Genera diagrama Mermaid"""
+        mermaid = "graph TD\n"
+        
+        for element_id, element in process.elements.items():
+            label = element.name.replace('"', '\\"')
+            
+            if element.type == ElementType.START_EVENT:
+                mermaid += f'  {element_id}["🟢 {label}"]\n'
+            elif element.type == ElementType.END_EVENT:
+                mermaid += f'  {element_id}["🔴 {label}"]\n'
+            elif element.type == ElementType.TASK:
+                mermaid += f'  {element_id}["📋 {label}"]\n'
+            elif element.type == ElementType.EXCLUSIVE_GATEWAY:
+                mermaid += f'  {element_id}{{{label}}}\n'
+        
+        for flow_id, flow in process.flows.items():
+            label = f"|{flow.name}|" if flow.name else ""
+            mermaid += f'  {flow.source_ref} -->|{label}| {flow.target_ref}\n'
+        
+        return mermaid
+
+
+if __name__ == "__main__":
+    # Ejemplo de uso
+    doc = """
+    El cliente solicita un préstamo. El gerente revisa la solicitud.
+    Si la documentación está completa, se evalúa el crédito.
+    Si no, se solicita documentación adicional.
+    Una vez evaluado, se aprueba o rechaza el préstamo.
+    Finalmente, se notifica al cliente.
+    """
+    
+    processor = BPMNProcessor(language="es")
+    result = processor.process(
+        input_text=doc,
+        process_name="Gestión de Préstamos",
+        swimlane_by="role",
+        output_formats=["bpmn_xml", "json", "svg", "mermaid"]
+    )
+    
+    if result["success"]:
+        # Guardar resultados
+        import os
+        os.makedirs("output", exist_ok=True)
+        
+        if "bpmn_xml" in result["data"]:
+            with open("output/process.bpmn", "w", encoding="utf-8") as f:
+                f.write(result["data"]["bpmn_xml"])
+            print("✓ BPMN XML guardado: output/process.bpmn")
+        
+        if "svg" in result["data"]:
+            with open("output/process.svg", "w", encoding="utf-8") as f:
+                f.write(result["data"]["svg"])
+            print("✓ SVG guardado: output/process.svg")
+        
+        print(f"\nMetadatos: {result['data']['metadata']}")

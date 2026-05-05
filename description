@@ -1,0 +1,393 @@
+"""
+BPMN Validator - Valida BPMN 2.0 compliance
+Tests - Pruebas completas del procesador
+"""
+
+import re
+from typing import List, Dict, Tuple
+from xml.etree import ElementTree as ET
+
+
+# ============================================================================
+# VALIDATOR
+# ============================================================================
+
+class BPMNValidator:
+    """Valida BPMN 2.0 compliance"""
+    
+    def __init__(self):
+        self.errors = []
+        self.warnings = []
+        self.info = []
+    
+    def validate_xml(self, bpmn_xml: str) -> Dict:
+        """Valida XML bien formado y BPMN 2.0 schema"""
+        self.errors = []
+        self.warnings = []
+        self.info = []
+        
+        try:
+            # Validar XML bien formado
+            root = ET.fromstring(bpmn_xml)
+            self.info.append("✓ XML bien formado")
+            
+            # Validar namespace BPMN 2.0
+            if 'http://www.omg.org/spec/BPMN/20100524/MODEL' not in bpmn_xml:
+                self.warnings.append("⚠ Namespace BPMN 2.0 no encontrado")
+            else:
+                self.info.append("✓ Namespace BPMN 2.0 presente")
+            
+            # Extraer procesos
+            ns = {'bpmn': 'http://www.omg.org/spec/BPMN/20100524/MODEL'}
+            processes = root.findall('.//bpmn:process', ns)
+            
+            if not processes:
+                self.errors.append("✗ No se encontraron procesos BPMN")
+                return self._get_report()
+            
+            self.info.append(f"✓ Encontrados {len(processes)} proceso(s)")
+            
+            # Validar cada proceso
+            for process in processes:
+                self._validate_process(process, ns)
+            
+        except ET.ParseError as e:
+            self.errors.append(f"✗ Error de parsing XML: {str(e)}")
+        except Exception as e:
+            self.errors.append(f"✗ Error inesperado: {str(e)}")
+        
+        return self._get_report()
+    
+    def _validate_process(self, process, ns: dict):
+        """Valida un proceso BPMN"""
+        process_id = process.get('id', 'unknown')
+        
+        # Validar elementos
+        elements = {
+            'startEvents': process.findall('bpmn:startEvent', ns),
+            'endEvents': process.findall('bpmn:endEvent', ns),
+            'tasks': process.findall('bpmn:task', ns),
+            'gateways': process.findall('bpmn:exclusiveGateway', ns),
+            'sequenceFlows': process.findall('bpmn:sequenceFlow', ns),
+        }
+        
+        # Validar inicio/fin
+        if not elements['startEvents']:
+            self.errors.append(f"✗ Proceso {process_id} sin startEvent")
+        else:
+            self.info.append(f"✓ Proceso {process_id} tiene startEvent(s)")
+        
+        if not elements['endEvents']:
+            self.errors.append(f"✗ Proceso {process_id} sin endEvent")
+        else:
+            self.info.append(f"✓ Proceso {process_id} tiene endEvent(s)")
+        
+        # Validar flujos conectados
+        element_ids = set()
+        for element_type, elements_list in elements.items():
+            for elem in elements_list:
+                elem_id = elem.get('id')
+                if elem_id:
+                    element_ids.add(elem_id)
+        
+        # Validar que todos los flujos referencian elementos existentes
+        for flow in elements['sequenceFlows']:
+            source = flow.get('sourceRef')
+            target = flow.get('targetRef')
+            
+            if source not in element_ids:
+                self.errors.append(f"✗ Flujo referencia elemento no existente: {source}")
+            if target not in element_ids:
+                self.errors.append(f"✗ Flujo referencia elemento no existente: {target}")
+        
+        # Validar IDs únicos
+        all_ids = [elem.get('id') for elem in process.iter()]
+        duplicates = [id for id in all_ids if all_ids.count(id) > 1]
+        if duplicates:
+            self.errors.append(f"✗ IDs duplicados encontrados: {set(duplicates)}")
+        else:
+            self.info.append(f"✓ Todos los IDs son únicos")
+        
+        # Validar gateways balanceados
+        for gateway in elements['gateways']:
+            gateway_id = gateway.get('id')
+            incoming = self._count_flows_for_element(elements['sequenceFlows'], 'targetRef', gateway_id)
+            outgoing = self._count_flows_for_element(elements['sequenceFlows'], 'sourceRef', gateway_id)
+            
+            if incoming != outgoing and incoming > 0 and outgoing > 0:
+                if incoming != 1 or outgoing < 2:
+                    self.warnings.append(
+                        f"⚠ Gateway {gateway_id} desbalanceado: "
+                        f"{incoming} incoming, {outgoing} outgoing"
+                    )
+        
+        # Validar nombres descriptivos
+        for element_type, elements_list in elements.items():
+            for elem in elements_list:
+                name = elem.get('name', '').strip()
+                if not name:
+                    elem_id = elem.get('id')
+                    self.warnings.append(f"⚠ Elemento {elem_id} sin nombre descriptivo")
+        
+        # Estadísticas
+        self.info.append(
+            f"✓ Proceso {process_id}: "
+            f"{len(elements['startEvents'])} start, "
+            f"{len(elements['endEvents'])} end, "
+            f"{len(elements['tasks'])} tasks, "
+            f"{len(elements['gateways'])} gateways, "
+            f"{len(elements['sequenceFlows'])} flows"
+        )
+    
+    def _count_flows_for_element(self, flows, attribute: str, element_id: str) -> int:
+        """Cuenta flujos que referencian un elemento"""
+        count = 0
+        for flow in flows:
+            if flow.get(attribute) == element_id:
+                count += 1
+        return count
+    
+    def _get_report(self) -> Dict:
+        """Genera reporte de validación"""
+        is_valid = len(self.errors) == 0
+        
+        return {
+            "valid": is_valid,
+            "errors": self.errors,
+            "warnings": self.warnings,
+            "info": self.info,
+            "summary": {
+                "total_errors": len(self.errors),
+                "total_warnings": len(self.warnings),
+                "total_info": len(self.info)
+            }
+        }
+
+
+# ============================================================================
+# TESTS
+# ============================================================================
+
+class TestBPMNGenerator:
+    """Tests completos para BPMN Generator"""
+    
+    @staticmethod
+    def test_extractor():
+        """Test de extractor"""
+        from bpmn_processor_complete import BPMNExtractor
+        
+        print("\n=== TEST: BPMNExtractor ===")
+        
+        extractor = BPMNExtractor(language="es")
+        
+        test_docs = [
+            {
+                "name": "Simple",
+                "text": "El cliente solicita un producto. El vendedor revisa stock. Si hay, prepara la factura. Si no, avisa al cliente.",
+                "expected": {
+                    "actors": 2,
+                    "tasks": 3,
+                    "decisions": 1
+                }
+            },
+            {
+                "name": "Con eventos",
+                "text": "La solicitud llega al sistema. Se valida. Si es válida se procesa, si no se rechaza. Finalmente se notifica.",
+                "expected": {
+                    "actors": 1,
+                    "tasks": 3,
+                    "decisions": 1
+                }
+            }
+        ]
+        
+        for test in test_docs:
+            result = extractor.extract(test["text"])
+            
+            actors = len(result.get("actors", []))
+            tasks = len(result.get("tasks", []))
+            decisions = len(result.get("decisions", []))
+            
+            status = "✓" if (
+                actors >= test["expected"]["actors"] and
+                tasks >= test["expected"]["tasks"] and
+                decisions >= test["expected"]["decisions"]
+            ) else "✗"
+            
+            print(f"{status} {test['name']}: {actors} actors, {tasks} tasks, {decisions} decisions")
+    
+    @staticmethod
+    def test_graph_builder():
+        """Test de graph builder"""
+        from bpmn_processor_complete import BPMNGraphBuilder, BPMNExtractor
+        
+        print("\n=== TEST: BPMNGraphBuilder ===")
+        
+        extractor = BPMNExtractor()
+        text = "El cliente solicita. El gerente revisa. Si está bien, aprueba. Si no, rechaza. Se notifica."
+        
+        extracted = extractor.extract(text)
+        
+        builder = BPMNGraphBuilder("Prueba")
+        process = builder.build(extracted, swimlane_by="role")
+        
+        print(f"✓ Proceso creado: {process.name}")
+        print(f"  - Elementos: {len(process.elements)}")
+        print(f"  - Flujos: {len(process.flows)}")
+        print(f"  - Lanes: {len(process.lanes)}")
+        
+        # Validar estructura
+        if process.elements and process.flows:
+            print(f"✓ Estructura válida")
+        else:
+            print(f"✗ Estructura inválida")
+    
+    @staticmethod
+    def test_serializer():
+        """Test de serialización XML"""
+        from bpmn_processor_complete import BPMNProcessor
+        
+        print("\n=== TEST: BPMNSerializer ===")
+        
+        processor = BPMNProcessor()
+        
+        test_doc = """
+        El cliente solicita un préstamo.
+        El gerente revisa la solicitud.
+        Si la documentación está completa, se evalúa el crédito.
+        Si no, se solicita documentación adicional.
+        Se aprueba o rechaza el préstamo.
+        Se notifica al cliente.
+        """
+        
+        result = processor.process(
+            test_doc,
+            process_name="Gestión de Préstamos",
+            swimlane_by="role",
+            output_formats=["bpmn_xml"]
+        )
+        
+        if result["success"]:
+            bpmn_xml = result["data"]["bpmn_xml"]
+            
+            # Validar XML
+            try:
+                ET.fromstring(bpmn_xml)
+                print(f"✓ XML bien formado")
+            except:
+                print(f"✗ XML malformado")
+                return
+            
+            # Validar BPMN
+            validator = BPMNValidator()
+            validation_result = validator.validate_xml(bpmn_xml)
+            
+            print(f"✓ BPMN Válido: {validation_result['valid']}")
+            print(f"  - Errores: {validation_result['summary']['total_errors']}")
+            print(f"  - Advertencias: {validation_result['summary']['total_warnings']}")
+            
+            # Mostrar info
+            for info in validation_result['info'][:5]:
+                print(f"  {info}")
+        else:
+            print(f"✗ Error procesando documento")
+    
+    @staticmethod
+    def test_validator():
+        """Test de validador"""
+        from bpmn_processor_complete import BPMNProcessor
+        
+        print("\n=== TEST: BPMNValidator ===")
+        
+        processor = BPMNProcessor()
+        
+        test_doc = "El cliente solicita. El vendedor revisa. Se aprueba o rechaza. Se notifica."
+        
+        result = processor.process(
+            test_doc,
+            process_name="Proceso Prueba",
+            output_formats=["bpmn_xml"]
+        )
+        
+        if result["success"]:
+            bpmn_xml = result["data"]["bpmn_xml"]
+            
+            validator = BPMNValidator()
+            validation = validator.validate_xml(bpmn_xml)
+            
+            print(f"\nValidación BPMN 2.0:")
+            print(f"{'Resultado':<15}: {'✓ VÁLIDO' if validation['valid'] else '✗ INVÁLIDO'}")
+            print(f"{'Errores':<15}: {validation['summary']['total_errors']}")
+            print(f"{'Advertencias':<15}: {validation['summary']['total_warnings']}")
+            
+            if validation['errors']:
+                print(f"\nErrores encontrados:")
+                for error in validation['errors']:
+                    print(f"  {error}")
+            
+            print(f"\nInformación:")
+            for info in validation['info'][:5]:
+                print(f"  {info}")
+    
+    @staticmethod
+    def test_svg_output():
+        """Test de generación SVG"""
+        from bpmn_processor_complete import BPMNProcessor
+        
+        print("\n=== TEST: SVG Renderer ===")
+        
+        processor = BPMNProcessor()
+        
+        test_doc = """
+        Se recibe una solicitud.
+        Se valida la información.
+        Si es válida, se procesa.
+        Si no, se rechaza.
+        Se envía la respuesta.
+        """
+        
+        result = processor.process(
+            test_doc,
+            process_name="Proceso SVG",
+            output_formats=["svg"]
+        )
+        
+        if result["success"]:
+            svg = result["data"]["svg"]
+            
+            # Validar SVG
+            if '<svg' in svg and '</svg>' in svg:
+                print(f"✓ SVG generado correctamente")
+                
+                # Contar elementos
+                rects = len(re.findall(r'<rect', svg))
+                circles = len(re.findall(r'<circle', svg))
+                lines = len(re.findall(r'<line', svg))
+                
+                print(f"  - Rectángulos (tareas): {rects}")
+                print(f"  - Círculos (eventos): {circles}")
+                print(f"  - Líneas (flujos): {lines}")
+            else:
+                print(f"✗ SVG inválido")
+    
+    @staticmethod
+    def run_all():
+        """Ejecuta todos los tests"""
+        print("="*60)
+        print("BPMN GENERATOR - TEST SUITE")
+        print("="*60)
+        
+        TestBPMNGenerator.test_extractor()
+        TestBPMNGenerator.test_graph_builder()
+        TestBPMNGenerator.test_serializer()
+        TestBPMNGenerator.test_validator()
+        TestBPMNGenerator.test_svg_output()
+        
+        print("\n" + "="*60)
+        print("TESTS COMPLETADOS")
+        print("="*60)
+
+
+if __name__ == "__main__":
+    # Ejecutar tests
+    TestBPMNGenerator.run_all()
